@@ -15,6 +15,7 @@ import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.Network;
 import org.testcontainers.containers.startupcheck.IsRunningStartupCheckStrategy;
 import org.testcontainers.containers.wait.strategy.Wait;
+import org.testcontainers.shaded.org.apache.commons.lang3.StringUtils;
 import org.verifyica.api.Argument;
 
 /** Class to implement OpenTelemetryTestEnvironment */
@@ -272,7 +273,7 @@ public class OpenTelemetryTestEnvironment implements Argument<OpenTelemetryTestE
                                 outputFrame -> {
                                     String string =
                                             outputFrame.getUtf8StringWithoutLineEnding().trim();
-                                    if (!string.isBlank()) {
+                                    if (!StringUtils.isBlank(string)) {
                                         System.out.println("> " + string);
                                     }
                                 })

@@ -356,7 +356,7 @@ public class CombinedModeTest {
             throws IOException {
         return sendRequest(
                 openTelemetryTestEnvironment,
-                "/api/v1/query?query=" + URLEncoder.encode(query, StandardCharsets.UTF_8));
+                "/api/v1/query?query=" + URLEncoder.encode(query, StandardCharsets.UTF_8.toString()));
     }
 
     /**
