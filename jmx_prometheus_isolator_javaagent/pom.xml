@@ -5,7 +5,7 @@
     <modelVersion>4.0.0</modelVersion>
 
     <parent>
-        <groupId>io.prometheus.jmx</groupId>
+        <groupId>io.arenadata.jmx</groupId>
         <artifactId>jmx_exporter</artifactId>
         <version>1.4.0-post</version>
     </parent>

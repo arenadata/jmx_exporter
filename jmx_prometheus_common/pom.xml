@@ -3,7 +3,7 @@
 
     <modelVersion>4.0.0</modelVersion>
     <parent>
-        <groupId>io.prometheus.jmx</groupId>
+        <groupId>io.arenadata.jmx</groupId>
         <artifactId>jmx_exporter</artifactId>
         <version>1.4.0-post</version>
     </parent>
@@ -48,7 +48,7 @@
             <artifactId>prometheus-metrics-exporter-opentelemetry</artifactId>
         </dependency>
         <dependency>
-            <groupId>io.prometheus.jmx</groupId>
+            <groupId>io.arenadata.jmx</groupId>
             <artifactId>collector</artifactId>
             <version>${project.version}</version>
         </dependency>

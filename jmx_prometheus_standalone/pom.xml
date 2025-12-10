@@ -3,7 +3,7 @@
 
     <modelVersion>4.0.0</modelVersion>
     <parent>
-        <groupId>io.prometheus.jmx</groupId>
+        <groupId>io.arenadata.jmx</groupId>
         <artifactId>jmx_exporter</artifactId>
         <version>1.4.0-post</version>
     </parent>
@@ -28,12 +28,12 @@
 
     <dependencies>
         <dependency>
-            <groupId>io.prometheus.jmx</groupId>
+            <groupId>io.arenadata.jmx</groupId>
             <artifactId>collector</artifactId>
             <version>${project.version}</version>
         </dependency>
         <dependency>
-            <groupId>io.prometheus.jmx</groupId>
+            <groupId>io.arenadata.jmx</groupId>
             <artifactId>jmx_prometheus_common</artifactId>
             <version>${project.version}</version>
         </dependency>
@@ -202,7 +202,7 @@
                 <!-- Add local project dependency -->
                 <dependencies>
                     <dependency>
-                        <groupId>io.prometheus.jmx</groupId>
+                        <groupId>io.arenadata.jmx</groupId>
                         <artifactId>jmx_prometheus_common</artifactId>
                         <version>${project.version}</version>
                     </dependency>
