@@ -71,6 +71,23 @@ final class VaultTrustStore {
         }
     }
 
+    /**
+     * Returns a socket factory that trusts the JVM default trust store and presents no client key.
+     * The JVM default SSL context would also load {@code javax.net.ssl.keyStore}, whose password
+     * may be the one about to be read from Vault.
+     *
+     * @throws IOException if the default trust store cannot be read
+     */
+    static SSLSocketFactory defaultSocketFactory() throws IOException {
+        try {
+            SSLContext sslContext = SSLContext.getInstance("TLS");
+            sslContext.init(null, null, null);
+            return sslContext.getSocketFactory();
+        } catch (GeneralSecurityException e) {
+            throw new IOException("Failed to set up TLS to Vault: " + e.getMessage(), e);
+        }
+    }
+
     static String typeOf(String filename) {
         String name = filename.toLowerCase(Locale.ROOT);
         if (name.endsWith(".pem") || name.endsWith(".crt") || name.endsWith(".cer")) {

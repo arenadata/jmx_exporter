@@ -266,8 +266,40 @@ public class KerberosVaultAuthTest {
         vault.setLoginHandler(authorization -> null);
         assertThatExceptionOfType(IOException.class)
                 .isThrownBy(() -> provider().getCredential(ALIAS))
-                .withMessageContaining("401");
+                .withMessageContaining("401")
+                .withMessageContaining("passthrough_request_headers");
         assertThat(vault.loginRoles()).hasSize(1);
+    }
+
+    @Test
+    public void testLoginIsRetried() throws Exception {
+        vault.fail(503, 1);
+        assertThat(provider().getCredential(ALIAS)).isEqualTo("s3cret");
+        assertThat(vault.requests())
+                .containsSubsequence(
+                        "POST " + MockVault.KERBEROS_LOGIN_PATH,
+                        "POST " + MockVault.KERBEROS_LOGIN_PATH);
+        assertThat(vault.loginRoles()).hasSize(1);
+    }
+
+    @Test
+    public void testTokenIsRevokedOnClose() throws Exception {
+        try (VaultCredentialProvider provider = provider()) {
+            assertThat(provider.getCredential(ALIAS)).isEqualTo("s3cret");
+        }
+        assertThat(vault.revokedTokens()).containsExactly("s.kerberos");
+    }
+
+    @Test
+    public void testHostPatternIsTheInstanceOnly() {
+        assertThat(KerberosVaultAuth.replaceHost("jmx/_HOST@CORP_HOSTS.COM", "h.example.com"))
+                .isEqualTo("jmx/h.example.com@CORP_HOSTS.COM");
+        assertThat(KerberosVaultAuth.replaceHost("HTTP/_HOST", "h.example.com"))
+                .isEqualTo("HTTP/h.example.com");
+        assertThat(KerberosVaultAuth.replaceHost("jmx/node1@EU_HOSTING.EXAMPLE", "h"))
+                .isEqualTo("jmx/node1@EU_HOSTING.EXAMPLE");
+        assertThat(KerberosVaultAuth.replaceHost("HTTP@_HOST", "h")).isEqualTo("HTTP@_HOST");
+        assertThat(KerberosVaultAuth.replaceHost("jmx/x_HOST@R", "h")).isEqualTo("jmx/x_HOST@R");
     }
 
     @Test

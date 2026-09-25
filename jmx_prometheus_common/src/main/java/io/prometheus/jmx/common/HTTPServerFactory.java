@@ -669,8 +669,8 @@ public class HTTPServerFactory {
     public static void configureSSL(
             MapAccessor rootMapAccessor, HTTPServer.Builder httpServerBuilder) {
         if (rootMapAccessor.containsPath("/httpServer/ssl")) {
+            VaultCredentialProvider credentialProvider = null;
             try {
-                VaultCredentialProvider credentialProvider = null;
                 if (rootMapAccessor.containsPath(CREDENTIAL_PROVIDER)) {
                     credentialProvider =
                             VaultCredentialProvider.create(rootMapAccessor, CREDENTIAL_PROVIDER);
@@ -835,6 +835,10 @@ public class HTTPServerFactory {
 
                 throw new ConfigurationException(
                         format("Exception loading SSL configuration%s", message), e);
+            } finally {
+                if (credentialProvider != null) {
+                    credentialProvider.close();
+                }
             }
         }
     }
@@ -856,26 +860,11 @@ public class HTTPServerFactory {
             String systemProperty,
             VaultCredentialProvider credentialProvider)
             throws IOException {
-        String passwordAlias =
-                rootMapAccessor
-                        .get(path + "/passwordAlias")
-                        .map(
-                                new ToString(
-                                        ConfigurationException.supplier(
-                                                format(
-                                                        "Invalid configuration for"
-                                                                + " %s/passwordAlias must be a"
-                                                                + " string",
-                                                        path))))
-                        .map(
-                                new StringIsNotBlank(
-                                        ConfigurationException.supplier(
-                                                format(
-                                                        "Invalid configuration for"
-                                                                + " %s/passwordAlias must not be"
-                                                                + " blank",
-                                                        path))))
-                        .orElse(null);
+        String passwordAlias = getString(rootMapAccessor, path + "/passwordAlias");
+        String password = getString(rootMapAccessor, path + "/password");
+        if (password == null) {
+            password = System.getProperty(systemProperty);
+        }
 
         if (passwordAlias != null) {
             if (credentialProvider == null) {
@@ -883,37 +872,55 @@ public class HTTPServerFactory {
                         format("%s/passwordAlias requires %s", path, CREDENTIAL_PROVIDER));
             }
 
-            String password = credentialProvider.getCredential(passwordAlias);
-            if (password != null) {
-                return password;
+            String credential = credentialProvider.getCredential(passwordAlias);
+            if (credential != null) {
+                if (credential.trim().isEmpty()) {
+                    throw new ConfigurationException(
+                            format("%s holds a blank %s", credentialProvider, passwordAlias));
+                }
+                return credential;
+            }
+
+            if (password == null) {
+                throw new ConfigurationException(
+                        format(
+                                "%s holds no %s, or the token may not read it, and neither"
+                                        + " %s/password nor the %s system property is set",
+                                credentialProvider, passwordAlias, path, systemProperty));
             }
 
             LOGGER.warn(
-                    "%s holds no %s, falling back to %s/password and the %s system property",
+                    "%s holds no %s, or the token may not read it; using %s/password or the %s"
+                            + " system property",
                     credentialProvider, passwordAlias, path, systemProperty);
         }
 
-        String password =
-                rootMapAccessor
-                        .get(path + "/password")
-                        .map(
-                                new ToString(
-                                        ConfigurationException.supplier(
-                                                format(
-                                                        "Invalid configuration for %s/password"
-                                                                + " must be a string",
-                                                        path))))
-                        .map(
-                                new StringIsNotBlank(
-                                        ConfigurationException.supplier(
-                                                format(
-                                                        "Invalid configuration for %s/password"
-                                                                + " must not be blank",
-                                                        path))))
-                        .orElse(System.getProperty(systemProperty));
-
-        // Resolve the password
         return VariableResolver.resolveVariable(password);
+    }
+
+    /**
+     * Method to get an optional string that must not be blank
+     *
+     * @param rootMapAccessor rootMapAccessor
+     * @param path the path of the string
+     * @return the string, or null if the path is not set
+     */
+    private static String getString(MapAccessor rootMapAccessor, String path) {
+        return rootMapAccessor
+                .get(path)
+                .map(
+                        new ToString(
+                                ConfigurationException.supplier(
+                                        format(
+                                                "Invalid configuration for %s must be a string",
+                                                path))))
+                .map(
+                        new StringIsNotBlank(
+                                ConfigurationException.supplier(
+                                        format(
+                                                "Invalid configuration for %s must not be blank",
+                                                path))))
+                .orElse(null);
     }
 
     /**

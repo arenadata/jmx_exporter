@@ -175,7 +175,19 @@ public class VaultCredentialProviderTest {
 
     @Test
     public void testCharactersYamlDoesNotAllowAreRead() throws Exception {
-        String value = "a" + (char) 0x7F + "b" + (char) 0x80 + "c" + (char) 0xFFFF + "d";
+        String value =
+                "a"
+                        + (char) 0x7F
+                        + "b"
+                        + (char) 0x80
+                        + "c"
+                        + (char) 0xFFFF
+                        + "d"
+                        + (char) 0x85
+                        + " e "
+                        + (char) 0x2028
+                        + " f"
+                        + (char) 0x2029;
         vault.putRaw(DATA_PATH, "{\"data\":{\"data\":{\"value\":\"" + value + "\"}}}");
         assertThat(provider().getCredential(ALIAS)).isEqualTo(value);
     }
@@ -230,9 +242,61 @@ public class VaultCredentialProviderTest {
     }
 
     @Test
-    public void testUnservedMountFails() {
+    public void testUnservedMountFails() throws Exception {
+        writeToken(MockVault.ROOT_TOKEN);
         assertThat(failure(() -> provider(vault.uri("missing/jmx")).getCredential(ALIAS)))
                 .hasMessageContaining("404");
+    }
+
+    @Test
+    public void testUnservedMountLooksLikeDenialToALimitedToken() throws Exception {
+        assertThat(provider(vault.uri("missing/jmx")).getCredential(ALIAS)).isNull();
+    }
+
+    @Test
+    public void testDeletedVersionIsAbsent() throws Exception {
+        StringBuilder metadata = new StringBuilder("{");
+        for (int i = 0; i < 40; i++) {
+            metadata.append(i == 0 ? "" : ",").append("\"key").append(i).append("\":\"");
+            for (int j = 0; j < 40; j++) {
+                metadata.append('v');
+            }
+            metadata.append('"');
+        }
+        vault.putDeleted(DATA_PATH, metadata.append('}').toString());
+        assertThat(provider().getCredential(ALIAS)).isNull();
+    }
+
+    @Test
+    public void testTokenLookupIsRetried() throws Exception {
+        vault.putSecret(DATA_PATH, "value", "s3cret");
+        vault.deny(DATA_PATH);
+        vault.failLookups(503, 2);
+        assertThat(provider().getCredential(ALIAS)).isNull();
+        assertThat(vault.requests())
+                .containsExactly(
+                        "GET /v1/" + DATA_PATH,
+                        "GET " + MockVault.LOOKUP_SELF_PATH,
+                        "GET " + MockVault.LOOKUP_SELF_PATH,
+                        "GET " + MockVault.LOOKUP_SELF_PATH);
+    }
+
+    @Test
+    public void testRequestHeaderIsSent() throws Exception {
+        vault.requireRequestHeader();
+        vault.putSecret(DATA_PATH, "value", "s3cret");
+        assertThat(provider().getCredential(ALIAS)).isEqualTo("s3cret");
+        assertThat(vault.requestsWithoutHeader()).isZero();
+    }
+
+    @Test
+    public void testTokenFromFileIsNotRevoked() throws Exception {
+        vault.putSecret(DATA_PATH, "value", "s3cret");
+        try (VaultCredentialProvider provider = provider()) {
+            assertThat(provider.getCredential(ALIAS)).isEqualTo("s3cret");
+        }
+        assertThat(vault.revokedTokens()).isEmpty();
+        assertThat(provider().getCredential(ALIAS)).isEqualTo("s3cret");
     }
 
     @Test

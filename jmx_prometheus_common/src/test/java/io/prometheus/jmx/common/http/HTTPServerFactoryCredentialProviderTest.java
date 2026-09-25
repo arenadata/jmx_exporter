@@ -163,6 +163,7 @@ public class HTTPServerFactoryCredentialProviderTest {
                         + keyStoreBlock("passwordAlias: " + KEYSTORE_ALIAS));
         assertThat(getMetrics(httpServer)).isEqualTo(200);
         assertThat(reads()).containsExactly(KEYSTORE_ALIAS);
+        assertThat(vault.revokedTokens()).isEmpty();
     }
 
     @Test
@@ -193,6 +194,33 @@ public class HTTPServerFactoryCredentialProviderTest {
                 providerBlock(vault.uri("secret/jmx"))
                         + keyStoreBlock("passwordAlias: " + KEYSTORE_ALIAS));
         assertThat(getMetrics(httpServer)).isEqualTo(200);
+    }
+
+    @Test
+    public void testAbsentAliasWithoutFallbackFails() {
+        assertThatExceptionOfType(ConfigurationException.class)
+                .isThrownBy(
+                        () ->
+                                start(
+                                        providerBlock(vault.uri("secret/jmx"))
+                                                + keyStoreBlock(
+                                                        "passwordAlias: " + KEYSTORE_ALIAS)))
+                .withMessageContaining("holds no " + KEYSTORE_ALIAS)
+                .withMessageContaining(KEYSTORE_PASSWORD_PROPERTY);
+    }
+
+    @Test
+    public void testBlankCredentialFails() {
+        vault.putSecret("secret/data/jmx/" + KEYSTORE_ALIAS, "value", " \n");
+        assertThatExceptionOfType(ConfigurationException.class)
+                .isThrownBy(
+                        () ->
+                                start(
+                                        providerBlock(vault.uri("secret/jmx"))
+                                                + keyStoreBlock(
+                                                        "passwordAlias: " + KEYSTORE_ALIAS,
+                                                        "password: changeit")))
+                .withMessageContaining("holds a blank " + KEYSTORE_ALIAS);
     }
 
     @Test

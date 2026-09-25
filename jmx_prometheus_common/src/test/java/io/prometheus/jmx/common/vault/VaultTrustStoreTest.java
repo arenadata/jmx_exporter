@@ -150,6 +150,36 @@ public class VaultTrustStoreTest {
     }
 
     @Test
+    public void testJvmTrustStoreWithoutKeyStorePassword() throws Exception {
+        String[] properties = {
+            "javax.net.ssl.trustStore",
+            "javax.net.ssl.trustStoreType",
+            "javax.net.ssl.keyStore",
+            "javax.net.ssl.keyStoreType"
+        };
+        String[] previous = new String[properties.length];
+        for (int i = 0; i < properties.length; i++) {
+            previous[i] = System.getProperty(properties[i]);
+        }
+        try {
+            System.setProperty(
+                    properties[0], resource("localhost-truststore.jks").getAbsolutePath());
+            System.setProperty(properties[1], "JKS");
+            System.setProperty(properties[2], resource("localhost.p12").getAbsolutePath());
+            System.setProperty(properties[3], "PKCS12");
+            assertThat(read()).isEqualTo("s3cret");
+        } finally {
+            for (int i = 0; i < properties.length; i++) {
+                if (previous[i] == null) {
+                    System.clearProperty(properties[i]);
+                } else {
+                    System.setProperty(properties[i], previous[i]);
+                }
+            }
+        }
+    }
+
+    @Test
     public void testServerOutsideTrustStore() {
         assertThatExceptionOfType(SSLHandshakeException.class).isThrownBy(this::read);
         assertThat(vault.requests()).isEmpty();

@@ -63,11 +63,11 @@ final class KerberosVaultAuth implements VaultAuthMethod {
      * Creates the login of a keytab principal.
      *
      * @param connInfo the Vault server
-     * @param principal the principal to log in as; {@code _HOST} stands for the canonical name of
-     *     the local host in lower case
+     * @param principal the principal to log in as; an instance of {@code _HOST} stands for the
+     *     canonical name of the local host in lower case
      * @param keytab the keytab of the principal
-     * @param servicePrincipal the Vault service principal; {@code _HOST} stands for the Vault host
-     *     in lower case, null means {@code HTTP@<Vault host>}
+     * @param servicePrincipal the Vault service principal; an instance of {@code _HOST} stands for
+     *     the Vault host in lower case, null means {@code HTTP@<Vault host>}
      * @param mountPath the mount path of the Kerberos auth method
      * @param role the role to log in with, or null to let Vault pick the one bound to the principal
      * @throws IOException if the principal names the local host, which cannot be resolved
@@ -81,15 +81,11 @@ final class KerberosVaultAuth implements VaultAuthMethod {
             String role)
             throws IOException {
         this.principal =
-                principal.contains(HOSTNAME_PATTERN)
-                        ? principal.replace(HOSTNAME_PATTERN, localHostName())
-                        : principal;
+                hasHostPattern(principal) ? replaceHost(principal, localHostName()) : principal;
         this.keytab = keytab;
         String host = connInfo.getHost().toLowerCase(Locale.ROOT);
         this.servicePrincipal =
-                servicePrincipal == null
-                        ? "HTTP@" + host
-                        : servicePrincipal.replace(HOSTNAME_PATTERN, host);
+                servicePrincipal == null ? "HTTP@" + host : replaceHost(servicePrincipal, host);
         String mount = VaultConnectionInfo.stripSlashes(mountPath);
         VaultConnectionInfo.checkPath(mount);
         this.loginUrl = connInfo.apiUrl(mount + "/login");
@@ -100,6 +96,28 @@ final class KerberosVaultAuth implements VaultAuthMethod {
         return InetAddress.getLocalHost().getCanonicalHostName().toLowerCase(Locale.ROOT);
     }
 
+    /** Whether the instance of {@code primary/instance[@REALM]} is {@code _HOST}. */
+    static boolean hasHostPattern(String principal) {
+        int slash = principal.indexOf('/');
+        if (slash < 0) {
+            return false;
+        }
+        int at = principal.indexOf('@', slash);
+        String instance =
+                at < 0 ? principal.substring(slash + 1) : principal.substring(slash + 1, at);
+        return instance.equals(HOSTNAME_PATTERN);
+    }
+
+    /** Replaces an instance of {@code _HOST} with the host, as Hadoop does. */
+    static String replaceHost(String principal, String host) {
+        if (!hasHostPattern(principal)) {
+            return principal;
+        }
+        int slash = principal.indexOf('/');
+        int at = principal.indexOf('@', slash);
+        return principal.substring(0, slash + 1) + host + (at < 0 ? "" : principal.substring(at));
+    }
+
     String getPrincipal() {
         return principal;
     }
@@ -107,10 +125,26 @@ final class KerberosVaultAuth implements VaultAuthMethod {
     @Override
     public String authenticate(VaultHttpClient client) throws IOException {
         String body = VaultHttpClient.json("role", role);
-        String response =
-                client.retrying(
-                        "Vault Kerberos login to " + loginUrl,
-                        () -> client.post(loginUrl, "Negotiate " + spnegoToken(), body));
+        // One KDC login per Vault login: the JDK retries the KDCs itself, and each retry of the
+        // POST reuses the ticket.
+        LoginContext loginContext = login();
+        String response;
+        try {
+            response =
+                    client.retrying(
+                            "Vault Kerberos login to " + loginUrl,
+                            () ->
+                                    client.post(
+                                            loginUrl,
+                                            "Negotiate " + spnegoToken(loginContext.getSubject()),
+                                            body));
+        } finally {
+            try {
+                loginContext.logout();
+            } catch (LoginException e) {
+                LOGGER.trace("Kerberos logout of %s failed: %s", principal, e);
+            }
+        }
         Object token =
                 VaultHttpClient.field(
                         VaultHttpClient.field(VaultHttpClient.parse(response, loginUrl), "auth"),
@@ -123,33 +157,33 @@ final class KerberosVaultAuth implements VaultAuthMethod {
         return (String) token;
     }
 
-    private String spnegoToken() throws IOException {
-        LoginContext loginContext;
+    @Override
+    public boolean issuesToken() {
+        return true;
+    }
+
+    private LoginContext login() throws IOException {
         try {
-            loginContext =
+            LoginContext loginContext =
                     new LoginContext(
                             LOGIN_CONTEXT_NAME,
                             new Subject(),
                             null,
                             new KeytabConfiguration(principal, keytab));
             loginContext.login();
+            return loginContext;
         } catch (LoginException | SecurityException e) {
             throw new IOException(
                     "Kerberos login of " + principal + " with keytab " + keytab + " failed", e);
         }
+    }
+
+    private String spnegoToken(Subject subject) throws IOException {
         try {
-            return Subject.doAs(
-                    loginContext.getSubject(),
-                    (PrivilegedExceptionAction<String>) this::initSecContext);
+            return Subject.doAs(subject, (PrivilegedExceptionAction<String>) this::initSecContext);
         } catch (PrivilegedActionException e) {
             throw new IOException(
                     "Failed to create a SPNEGO token for " + servicePrincipal, e.getException());
-        } finally {
-            try {
-                loginContext.logout();
-            } catch (LoginException e) {
-                LOGGER.trace("Kerberos logout of %s failed: %s", principal, e);
-            }
         }
     }
 
@@ -186,7 +220,6 @@ final class KerberosVaultAuth implements VaultAuthMethod {
             options.put("storeKey", "false");
             options.put("useTicketCache", "false");
             options.put("doNotPrompt", "true");
-            options.put("refreshKrb5Config", "true");
             options.put("isInitiator", "true");
             entry =
                     new AppConfigurationEntry(

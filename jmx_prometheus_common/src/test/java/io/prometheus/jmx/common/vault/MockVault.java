@@ -37,14 +37,18 @@ import java.util.concurrent.atomic.AtomicInteger;
 import javax.net.ssl.SSLContext;
 
 /**
- * A KV v2 engine, token lookup and a Kerberos auth method served over HTTP or HTTPS by {@code
- * com.sun.net.httpserver}.
+ * A KV v2 engine at {@code secret/}, token lookup and revocation and a Kerberos auth method served
+ * over HTTP or HTTPS by {@code com.sun.net.httpserver}. As Vault does, it checks the policy of the
+ * token before routing: {@link #ROOT_TOKEN} may read anything, any other token only {@code
+ * secret/data/}.
  */
 public final class MockVault implements AutoCloseable {
 
     public static final String TOKEN = "s.mock-token";
+    public static final String ROOT_TOKEN = "s.root";
     public static final String KERBEROS_LOGIN_PATH = "/v1/auth/kerberos/login";
     public static final String LOOKUP_SELF_PATH = "/v1/auth/token/lookup-self";
+    public static final String REVOKE_SELF_PATH = "/v1/auth/token/revoke-self";
 
     /** Checks the SPNEGO token of a Kerberos login. */
     public interface LoginHandler {
@@ -61,15 +65,21 @@ public final class MockVault implements AutoCloseable {
     private final String protocol;
     private final Map<String, Map<String, String>> secrets = new ConcurrentHashMap<>();
     private final Map<String, String> rawResponses = new ConcurrentHashMap<>();
+    private final Map<String, String> deletedVersions = new ConcurrentHashMap<>();
     private final List<String> requests = new CopyOnWriteArrayList<>();
     private final Set<String> acceptedTokens =
             Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
     private final Set<String> deniedPaths =
             Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
     private final List<String> loginRoles = new CopyOnWriteArrayList<>();
+    private final List<String> revokedTokens = new CopyOnWriteArrayList<>();
+    private final AtomicInteger requestsWithoutHeader = new AtomicInteger();
     private final AtomicInteger failures = new AtomicInteger();
+    private final AtomicInteger lookupFailures = new AtomicInteger();
     private volatile int failureStatus;
     private volatile String failureBody;
+    private volatile int lookupFailureStatus;
+    private volatile boolean requireRequestHeader;
     private volatile LoginHandler loginHandler;
     private volatile String loginRedirect;
 
@@ -92,6 +102,7 @@ public final class MockVault implements AutoCloseable {
         server.createContext("/v1/", this::handle);
         server.start();
         acceptedTokens.add(TOKEN);
+        acceptedTokens.add(ROOT_TOKEN);
     }
 
     /** The provider URI of a KV path on this server, such as {@code secret/app}. */
@@ -119,6 +130,14 @@ public final class MockVault implements AutoCloseable {
     /** Answers reads of a KV v2 data path with 200 and the given body. */
     public void putRaw(String dataPath, String body) {
         rawResponses.put(dataPath, body);
+    }
+
+    /**
+     * Answers reads of a KV v2 data path with the 404 of a deleted latest version, which carries
+     * the metadata of the secret.
+     */
+    public void putDeleted(String dataPath, String customMetadataJson) {
+        deletedVersions.put(dataPath, customMetadataJson);
     }
 
     public void acceptToken(String token) {
@@ -154,6 +173,27 @@ public final class MockVault implements AutoCloseable {
         failures.set(count);
     }
 
+    /** Answers the next {@code count} token lookups with {@code status}. */
+    public void failLookups(int status, int count) {
+        lookupFailureStatus = status;
+        lookupFailures.set(count);
+    }
+
+    /** Answers requests without an {@code X-Vault-Request} header with 412, as Bao Agent can. */
+    public void requireRequestHeader() {
+        requireRequestHeader = true;
+    }
+
+    /** The number of requests that came without an {@code X-Vault-Request} header. */
+    public int requestsWithoutHeader() {
+        return requestsWithoutHeader.get();
+    }
+
+    /** The tokens revoked through {@code revoke-self}. */
+    public List<String> revokedTokens() {
+        return revokedTokens;
+    }
+
     /** Every request received, as method and path. */
     public List<String> requests() {
         return requests;
@@ -166,13 +206,21 @@ public final class MockVault implements AutoCloseable {
 
     private void handle(HttpExchange exchange) throws IOException {
         String body = read(exchange.getRequestBody());
+        String method = exchange.getRequestMethod();
         String path = exchange.getRequestURI().getPath();
-        requests.add(exchange.getRequestMethod() + " " + path);
+        requests.add(method + " " + path);
+        if (!"true".equals(exchange.getRequestHeaders().getFirst("X-Vault-Request"))) {
+            requestsWithoutHeader.incrementAndGet();
+            if (requireRequestHeader) {
+                respond(exchange, 412, "{\"errors\":[\"missing \\\"X-Vault-Request\\\" header\"]}");
+                return;
+            }
+        }
         if (failures.getAndUpdate(n -> n > 0 ? n - 1 : 0) > 0) {
             respond(exchange, failureStatus, failureBody);
             return;
         }
-        if (path.equals(KERBEROS_LOGIN_PATH) && exchange.getRequestMethod().equals("POST")) {
+        if (path.equals(KERBEROS_LOGIN_PATH) && method.equals("POST")) {
             String redirect = loginRedirect;
             if (redirect != null) {
                 exchange.getResponseHeaders().set("Location", redirect);
@@ -185,27 +233,55 @@ public final class MockVault implements AutoCloseable {
         String token = exchange.getRequestHeaders().getFirst("X-Vault-Token");
         boolean accepted = token != null && acceptedTokens.contains(token);
         if (path.equals(LOOKUP_SELF_PATH)) {
+            if (lookupFailures.getAndUpdate(n -> n > 0 ? n - 1 : 0) > 0) {
+                respond(exchange, lookupFailureStatus, "{\"errors\":[\"injected failure\"]}");
+                return;
+            }
             respond(
                     exchange,
                     accepted ? 200 : 403,
                     accepted ? "{\"data\":{}}" : "{\"errors\":[\"permission denied\"]}");
             return;
         }
+        if (path.equals(REVOKE_SELF_PATH) && method.equals("POST")) {
+            if (accepted) {
+                acceptedTokens.remove(token);
+                revokedTokens.add(token);
+            }
+            respond(
+                    exchange,
+                    accepted ? 204 : 403,
+                    accepted ? "" : "{\"errors\":[\"permission denied\"]}");
+            return;
+        }
         String dataPath = path.substring("/v1/".length());
-        if (!exchange.getRequestMethod().equals("GET") || !dataPath.startsWith("secret/data/")) {
+        boolean root = accepted && ROOT_TOKEN.equals(token);
+        boolean served = method.equals("GET") && dataPath.startsWith("secret/data/");
+        if (!accepted || (!root && (!served || deniedPaths.contains(dataPath)))) {
+            respond(exchange, 403, "{\"errors\":[\"permission denied\"]}");
+            return;
+        }
+        if (!served) {
             respond(
                     exchange,
                     404,
                     "{\"errors\":[\"no handler for route \\\"" + dataPath + "\\\"\"]}");
             return;
         }
-        if (!accepted || deniedPaths.contains(dataPath)) {
-            respond(exchange, 403, "{\"errors\":[\"permission denied\"]}");
-            return;
-        }
         String raw = rawResponses.get(dataPath);
         if (raw != null) {
             respond(exchange, 200, raw);
+            return;
+        }
+        String deleted = deletedVersions.get(dataPath);
+        if (deleted != null) {
+            respond(
+                    exchange,
+                    404,
+                    "{\"request_id\":\"1\",\"data\":{\"data\":null,\"metadata\":{\"custom_metadata\":"
+                            + deleted
+                            + ",\"deletion_time\":\"2026-01-01T00:00:00Z\",\"destroyed\":false,"
+                            + "\"version\":2}},\"warnings\":null}");
             return;
         }
         Map<String, String> fields = secrets.get(dataPath);

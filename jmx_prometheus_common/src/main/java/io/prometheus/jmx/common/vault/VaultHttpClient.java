@@ -51,12 +51,13 @@ final class VaultHttpClient {
     private static final Logger LOGGER = LoggerFactory.getLogger(VaultHttpClient.class);
 
     private static final String TOKEN_HEADER = "X-Vault-Token";
+    private static final String REQUEST_HEADER = "X-Vault-Request";
     private static final int TEMPORARY_REDIRECT = 307;
     private static final int PERMANENT_REDIRECT = 308;
     private static final int MAX_REDIRECTS = 3;
     private static final int TOO_MANY_REQUESTS = 429;
     private static final int MAX_BODY_BYTES = 1 << 20;
-    private static final int MAX_ERROR_BYTES = 1024;
+    private static final int MAX_ERROR_LENGTH = 1024;
 
     private final VaultConnectionInfo connInfo;
     private final VaultAuthMethod authMethod;
@@ -180,16 +181,24 @@ final class VaultHttpClient {
 
     /**
      * Whether Vault still accepts the token. A token whose policy has no access to {@code
-     * auth/token/lookup-self} counts as refused.
+     * auth/token/lookup-self} counts as refused; a busy or unreachable Vault is retried, not taken
+     * for a refusal.
      */
-    private boolean isAccepted(String token) {
-        try {
-            return get(connInfo.apiUrl("auth/token/lookup-self"), token).status
-                    == HttpURLConnection.HTTP_OK;
-        } catch (IOException e) {
-            LOGGER.trace("Vault token lookup failed: %s", e);
-            return false;
-        }
+    private boolean isAccepted(String token) throws IOException {
+        String url = connInfo.apiUrl("auth/token/lookup-self");
+        return retrying(
+                "Vault token lookup",
+                () -> {
+                    Response response = get(url, token);
+                    if (response.status == HttpURLConnection.HTTP_OK) {
+                        return true;
+                    }
+                    RequestFailedException failure = response.failure();
+                    if (failure.isTransient()) {
+                        throw failure;
+                    }
+                    return false;
+                });
     }
 
     /** Runs a request that is safe to repeat, retrying transient failures. */
@@ -263,14 +272,45 @@ final class VaultHttpClient {
                 target = next;
                 continue;
             }
+            // Streaming mode leaves no body to read after a 401.
+            String detail =
+                    status == HttpURLConnection.HTTP_UNAUTHORIZED
+                            ? "the auth mount must pass the Authorization header through"
+                                    + " (passthrough_request_headers)"
+                            : readErrorBody(conn.getErrorStream());
             throw new RequestFailedException(
-                    status,
-                    "POST "
-                            + target
-                            + " failed with status "
-                            + status
-                            + ": "
-                            + readErrorBody(conn.getErrorStream()));
+                    status, "POST " + target + " failed with status " + status + ": " + detail);
+        }
+    }
+
+    /**
+     * Revokes the token of a login, which the client no longer needs; a token read from a file is
+     * left alone. A failure is logged: the token then expires with its TTL.
+     */
+    void close() {
+        String token = clientToken;
+        clientToken = null;
+        if (token == null || !authMethod.issuesToken()) {
+            return;
+        }
+        String url = connInfo.apiUrl("auth/token/revoke-self");
+        try {
+            HttpURLConnection conn = open(new URL(url), "POST");
+            conn.setRequestProperty(TOKEN_HEADER, token);
+            conn.setDoOutput(true);
+            conn.setFixedLengthStreamingMode(0);
+            conn.getOutputStream().close();
+            int status = responseCode(conn);
+            readErrorBody(
+                    status >= HttpURLConnection.HTTP_BAD_REQUEST
+                            ? conn.getErrorStream()
+                            : conn.getInputStream());
+            if (status != HttpURLConnection.HTTP_OK
+                    && status != HttpURLConnection.HTTP_NO_CONTENT) {
+                LOGGER.warn("Revoking the Vault token at %s failed with status %d", url, status);
+            }
+        } catch (IOException e) {
+            LOGGER.warn("Revoking the Vault token at %s failed: %s", url, e.getMessage());
         }
     }
 
@@ -278,16 +318,16 @@ final class VaultHttpClient {
         HttpURLConnection conn = open(new URL(url), "GET");
         conn.setRequestProperty(TOKEN_HEADER, token);
         int status = responseCode(conn);
-        String body;
-        if (status == HttpURLConnection.HTTP_OK) {
-            body = readBody(conn.getInputStream());
-        } else {
-            body =
-                    readErrorBody(
-                            status >= HttpURLConnection.HTTP_BAD_REQUEST
-                                    ? conn.getErrorStream()
-                                    : conn.getInputStream());
-        }
+        InputStream in =
+                status >= HttpURLConnection.HTTP_BAD_REQUEST
+                        ? conn.getErrorStream()
+                        : conn.getInputStream();
+        // A 404 is parsed: it tells a deleted version, with all its metadata, from a missing
+        // engine.
+        String body =
+                status == HttpURLConnection.HTTP_OK || status == HttpURLConnection.HTTP_NOT_FOUND
+                        ? readBody(in)
+                        : readErrorBody(in);
         return new Response(url, status, body);
     }
 
@@ -297,6 +337,7 @@ final class VaultHttpClient {
         conn.setConnectTimeout(connectTimeoutMs);
         conn.setReadTimeout(readTimeoutMs);
         conn.setUseCaches(false);
+        conn.setRequestProperty(REQUEST_HEADER, "true");
         if (sslSocketFactory != null && conn instanceof HttpsURLConnection) {
             ((HttpsURLConnection) conn).setSSLSocketFactory(sslSocketFactory);
         }
@@ -321,10 +362,14 @@ final class VaultHttpClient {
 
     /** The start of an error answer, which goes into exception messages. */
     private static String readErrorBody(InputStream is) throws IOException {
-        byte[] body = readUpTo(is, MAX_ERROR_BYTES);
-        String text =
-                new String(body, 0, Math.min(body.length, MAX_ERROR_BYTES), StandardCharsets.UTF_8);
-        return body.length > MAX_ERROR_BYTES ? text + "..." : text;
+        byte[] body = readUpTo(is, MAX_ERROR_LENGTH);
+        return abbreviate(new String(body, StandardCharsets.UTF_8));
+    }
+
+    private static String abbreviate(String text) {
+        return text.length() > MAX_ERROR_LENGTH
+                ? text.substring(0, MAX_ERROR_LENGTH) + "..."
+                : text;
     }
 
     /** Reads a stream until it ends or holds more than limit bytes. */
@@ -369,8 +414,8 @@ final class VaultHttpClient {
 
     /**
      * Rewrites the JSON that YAML 1.1 reads otherwise or rejects: the {@code \/} escape, tabs
-     * between tokens, and characters YAML does not allow in a document, which JSON strings may hold
-     * unescaped.
+     * between tokens, and characters JSON strings may hold unescaped that YAML does not allow in a
+     * document or folds as line breaks (NEL, LS, PS).
      */
     static String toYaml(String json) {
         StringBuilder sb = new StringBuilder(json.length());
@@ -406,8 +451,7 @@ final class VaultHttpClient {
                 || c == 0xA
                 || c == 0xD
                 || (c >= 0x20 && c <= 0x7E)
-                || c == 0x85
-                || (c >= 0xA0 && c <= 0xD7FF)
+                || (c >= 0xA0 && c <= 0xD7FF && c != 0x2028 && c != 0x2029)
                 || (c >= 0xE000 && c <= 0xFFFD)
                 || (c >= 0x10000 && c <= 0x10FFFF);
     }
@@ -479,7 +523,8 @@ final class VaultHttpClient {
 
         RequestFailedException failure() {
             return new RequestFailedException(
-                    status, "GET " + url + " failed with status " + status + ": " + body);
+                    status,
+                    "GET " + url + " failed with status " + status + ": " + abbreviate(body));
         }
     }
 

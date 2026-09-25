@@ -32,19 +32,19 @@ import java.util.Locale;
 import javax.net.ssl.SSLSocketFactory;
 
 /**
- * Reads credentials from a KV v2 secrets engine of HashiCorp Vault or OpenBao. The URI and the
- * secret layout are those of the Hadoop {@code vault://} credential provider, so {@code hadoop
- * credential create} writes secrets this provider reads.
+ * Reads credentials from a KV v2 secrets engine of HashiCorp Vault or OpenBao. Each alias is a
+ * separate secret whose {@code value} field, unless the URI names another, holds the credential.
+ * Closing the provider revokes the token a login obtained.
  */
-public final class VaultCredentialProvider {
+public final class VaultCredentialProvider implements AutoCloseable {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(VaultCredentialProvider.class);
 
     private static final String AUTH_METHOD_TOKEN = "token";
     private static final String AUTH_METHOD_KERBEROS = "kerberos";
     private static final String KERBEROS_MOUNT_PATH_DEFAULT = "auth/kerberos";
-    private static final int CONNECT_TIMEOUT_MS_DEFAULT = 30000;
-    private static final int READ_TIMEOUT_MS_DEFAULT = 30000;
+    private static final int CONNECT_TIMEOUT_MS_DEFAULT = 5000;
+    private static final int READ_TIMEOUT_MS_DEFAULT = 10000;
     private static final int RETRY_COUNT_DEFAULT = 3;
     private static final int RETRY_INTERVAL_MS_DEFAULT = 1000;
 
@@ -102,13 +102,17 @@ public final class VaultCredentialProvider {
 
         SSLSocketFactory sslSocketFactory = null;
         String trustStoreFilename = string(rootMapAccessor, path + "/trustStore/filename");
-        if (connInfo.isHttps() && trustStoreFilename != null) {
+        if (connInfo.isHttps()) {
             sslSocketFactory =
-                    VaultTrustStore.socketFactory(
-                            trustStoreFilename,
-                            string(rootMapAccessor, path + "/trustStore/type"),
-                            VariableResolver.resolveVariable(
-                                    string(rootMapAccessor, path + "/trustStore/password")));
+                    trustStoreFilename == null
+                            ? VaultTrustStore.defaultSocketFactory()
+                            : VaultTrustStore.socketFactory(
+                                    trustStoreFilename,
+                                    string(rootMapAccessor, path + "/trustStore/type"),
+                                    VariableResolver.resolveVariable(
+                                            string(
+                                                    rootMapAccessor,
+                                                    path + "/trustStore/password")));
         }
 
         VaultHttpClient client =
@@ -160,6 +164,12 @@ public final class VaultCredentialProvider {
         }
         LOGGER.info("Read %s from %s", alias, connInfo);
         return stripLineEnd(value);
+    }
+
+    /** Revokes the token a login obtained; a token read from a file stays valid. */
+    @Override
+    public void close() {
+        client.close();
     }
 
     /**

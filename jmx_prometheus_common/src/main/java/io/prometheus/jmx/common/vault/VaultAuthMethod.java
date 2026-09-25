@@ -29,4 +29,13 @@ interface VaultAuthMethod {
      * @throws IOException if the login fails
      */
     String authenticate(VaultHttpClient client) throws IOException;
+
+    /**
+     * Whether each login issues a new token, which the client revokes once it is done.
+     *
+     * @return true for a login that issues tokens, false for a token supplied from outside
+     */
+    default boolean issuesToken() {
+        return false;
+    }
 }
