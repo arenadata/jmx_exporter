@@ -9,6 +9,7 @@ HTTP mode supports configuring SSL (HTTPS) access using either a JKS or PKCS12 f
 
 - Keystore type is dependent on the Java version
 - Exporter YAML configuration overrides System properties
+- Keystore and truststore passwords can be read from Vault or OpenBao, see [credential provider](../credential-provider)
 
 ### Configuration (using Exporter YAML)
 

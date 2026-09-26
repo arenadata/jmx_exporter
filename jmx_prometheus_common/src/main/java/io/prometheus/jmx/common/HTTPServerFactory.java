@@ -33,6 +33,9 @@ import io.prometheus.jmx.common.util.functions.ToBoolean;
 import io.prometheus.jmx.common.util.functions.ToInteger;
 import io.prometheus.jmx.common.util.functions.ToMapAccessor;
 import io.prometheus.jmx.common.util.functions.ToString;
+import io.prometheus.jmx.common.vault.VaultCredentialProvider;
+import io.prometheus.jmx.logger.Logger;
+import io.prometheus.jmx.logger.LoggerFactory;
 import io.prometheus.jmx.variable.VariableResolver;
 import io.prometheus.metrics.exporter.httpserver.HTTPServer;
 import io.prometheus.metrics.model.registry.PrometheusRegistry;
@@ -59,6 +62,10 @@ import javax.net.ssl.SSLParameters;
  * Class to create the HTTPServer used by both the Java agent exporter and the Standalone exporter
  */
 public class HTTPServerFactory {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(HTTPServerFactory.class);
+
+    private static final String CREDENTIAL_PROVIDER = "/httpServer/credentialProvider";
 
     private static final String JAVAX_NET_SSL_KEY_STORE = "javax.net.ssl.keyStore";
     private static final String JAVAX_NET_SSL_KEY_STORE_TYPE = "javax.net.ssl.keyStoreType";
@@ -662,7 +669,13 @@ public class HTTPServerFactory {
     public static void configureSSL(
             MapAccessor rootMapAccessor, HTTPServer.Builder httpServerBuilder) {
         if (rootMapAccessor.containsPath("/httpServer/ssl")) {
+            VaultCredentialProvider credentialProvider = null;
             try {
+                if (rootMapAccessor.containsPath(CREDENTIAL_PROVIDER)) {
+                    credentialProvider =
+                            VaultCredentialProvider.create(rootMapAccessor, CREDENTIAL_PROVIDER);
+                }
+
                 String keyStoreFilename =
                         rootMapAccessor
                                 .get("/httpServer/ssl/keyStore/filename")
@@ -698,24 +711,11 @@ public class HTTPServerFactory {
                                 .orElse(DEFAULT_KEYSTORE_TYPE);
 
                 String keyStorePassword =
-                        rootMapAccessor
-                                .get("/httpServer/ssl/keyStore/password")
-                                .map(
-                                        new ToString(
-                                                ConfigurationException.supplier(
-                                                        "Invalid configuration for"
-                                                            + " /httpServer/ssl/keyStore/password"
-                                                            + " must be a string")))
-                                .map(
-                                        new StringIsNotBlank(
-                                                ConfigurationException.supplier(
-                                                        "Invalid configuration for"
-                                                            + " /httpServer/ssl/keyStore/password"
-                                                            + " must not be blank")))
-                                .orElse(System.getProperty(JAVAX_NET_SSL_KEY_STORE_PASSWORD));
-
-                // Resolve the password
-                keyStorePassword = VariableResolver.resolveVariable(keyStorePassword);
+                        getPassword(
+                                rootMapAccessor,
+                                "/httpServer/ssl/keyStore",
+                                JAVAX_NET_SSL_KEY_STORE_PASSWORD,
+                                credentialProvider);
 
                 String certificateAlias =
                         rootMapAccessor
@@ -800,24 +800,11 @@ public class HTTPServerFactory {
                                     .orElse(DEFAULT_TRUST_STORE_TYPE);
 
                     trustStorePassword =
-                            rootMapAccessor
-                                    .get("/httpServer/ssl/trustStore/password")
-                                    .map(
-                                            new ToString(
-                                                    ConfigurationException.supplier(
-                                                            "Invalid configuration for"
-                                                                + " /httpServer/ssl/trustStore/password"
-                                                                + " must be a string")))
-                                    .map(
-                                            new StringIsNotBlank(
-                                                    ConfigurationException.supplier(
-                                                            "Invalid configuration for"
-                                                                + " /httpServer/ssl/trustStore/password"
-                                                                + " must not be blank")))
-                                    .orElse(System.getProperty(JAVAX_NET_SSL_TRUST_STORE_PASSWORD));
-
-                    // Resolve the password
-                    trustStorePassword = VariableResolver.resolveVariable(trustStorePassword);
+                            getPassword(
+                                    rootMapAccessor,
+                                    "/httpServer/ssl/trustStore",
+                                    JAVAX_NET_SSL_TRUST_STORE_PASSWORD,
+                                    credentialProvider);
                 }
 
                 httpServerBuilder.httpsConfigurator(
@@ -848,8 +835,92 @@ public class HTTPServerFactory {
 
                 throw new ConfigurationException(
                         format("Exception loading SSL configuration%s", message), e);
+            } finally {
+                if (credentialProvider != null) {
+                    credentialProvider.close();
+                }
             }
         }
+    }
+
+    /**
+     * Method to get a keystore or truststore password: the credential provider secret named by
+     * passwordAlias, else the password, else the system property
+     *
+     * @param rootMapAccessor rootMapAccessor
+     * @param path the path of the keystore or truststore configuration
+     * @param systemProperty the system property that holds the password
+     * @param credentialProvider the credential provider, or null if none is configured
+     * @return the password, or null if none is configured
+     * @throws IOException if the credential provider cannot be read
+     */
+    private static String getPassword(
+            MapAccessor rootMapAccessor,
+            String path,
+            String systemProperty,
+            VaultCredentialProvider credentialProvider)
+            throws IOException {
+        String passwordAlias = getString(rootMapAccessor, path + "/passwordAlias");
+        String password = getString(rootMapAccessor, path + "/password");
+        if (password == null) {
+            password = System.getProperty(systemProperty);
+        }
+
+        if (passwordAlias != null) {
+            if (credentialProvider == null) {
+                throw new ConfigurationException(
+                        format("%s/passwordAlias requires %s", path, CREDENTIAL_PROVIDER));
+            }
+
+            String credential = credentialProvider.getCredential(passwordAlias);
+            if (credential != null) {
+                if (credential.trim().isEmpty()) {
+                    throw new ConfigurationException(
+                            format("%s holds a blank %s", credentialProvider, passwordAlias));
+                }
+                return credential;
+            }
+
+            if (password == null) {
+                throw new ConfigurationException(
+                        format(
+                                "%s holds no %s, or the token may not read it, and neither"
+                                        + " %s/password nor the %s system property is set",
+                                credentialProvider, passwordAlias, path, systemProperty));
+            }
+
+            LOGGER.warn(
+                    "%s holds no %s, or the token may not read it; using %s/password or the %s"
+                            + " system property",
+                    credentialProvider, passwordAlias, path, systemProperty);
+        }
+
+        return VariableResolver.resolveVariable(password);
+    }
+
+    /**
+     * Method to get an optional string that must not be blank
+     *
+     * @param rootMapAccessor rootMapAccessor
+     * @param path the path of the string
+     * @return the string, or null if the path is not set
+     */
+    private static String getString(MapAccessor rootMapAccessor, String path) {
+        return rootMapAccessor
+                .get(path)
+                .map(
+                        new ToString(
+                                ConfigurationException.supplier(
+                                        format(
+                                                "Invalid configuration for %s must be a string",
+                                                path))))
+                .map(
+                        new StringIsNotBlank(
+                                ConfigurationException.supplier(
+                                        format(
+                                                "Invalid configuration for %s must not be blank",
+                                                path))))
+                .orElse(null);
     }
 
     /**

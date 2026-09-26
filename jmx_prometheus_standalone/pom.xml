@@ -175,6 +175,7 @@
                                     </includes>
                                     <excludes>
                                         <exclude>com.sun.**</exclude>
+                                        <exclude>org.ietf.jgss.**</exclude>
                                         <exclude>io.prometheus.metrics.shaded.**</exclude>
                                         <exclude>io.prometheus.jmx.Standalone</exclude>
                                     </excludes>
